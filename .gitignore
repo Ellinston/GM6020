@@ -1,0 +1,29 @@
+# =========================
+# STM32CubeIDE Build Files
+# =========================
+Debug/
+Release/
+
+# 编译产生的文件
+*.o
+*.d
+*.su
+*.map
+*.elf
+*.hex
+*.bin
+*.list
+
+# CubeIDE 配置
+.settings/
+
+# VS Code（如果以后需要共享配置，可以删掉这一行）
+.vscode/
+
+# 临时文件
+*.tmp
+*.log
+
+# Windows
+Thumbs.db
+Desktop.ini
