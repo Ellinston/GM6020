@@ -45,6 +45,12 @@ FDCAN_HandleTypeDef hfdcan2;
 
 /* USER CODE BEGIN PV */
 
+/* GM6020 raw feedback values for CubeIDE Live Expressions / Watch. */
+volatile uint8_t gm6020_rx_data[8] = {0};
+volatile uint32_t gm6020_rx_count = 0;
+volatile uint32_t fdcan2_last_rx_id = 0;
+volatile uint32_t fdcan2_rx_error_count = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -132,7 +138,7 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  GM6020_SendCurrent(5000,0,0,0);
+	  GM6020_SendCurrent(3000,0,0,0);
 
 	  HAL_Delay(2);
     /* USER CODE END WHILE */
@@ -286,6 +292,42 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
+                               uint32_t RxFifo0ITs)
+{
+    FDCAN_RxHeaderTypeDef rx_header;
+    uint8_t rx_data[8];
+    uint32_t i;
+
+    if ((hfdcan->Instance != FDCAN2) ||
+        ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) == 0U))
+    {
+        return;
+    }
+
+    if (HAL_FDCAN_GetRxMessage(hfdcan,
+                               FDCAN_RX_FIFO0,
+                               &rx_header,
+                               rx_data) != HAL_OK)
+    {
+        fdcan2_rx_error_count++;
+        return;
+    }
+
+    fdcan2_last_rx_id = rx_header.Identifier;
+
+    if ((rx_header.IdType == FDCAN_STANDARD_ID) &&
+        (rx_header.Identifier == 0x205U))
+    {
+        for (i = 0; i < 8U; i++)
+        {
+            gm6020_rx_data[i] = rx_data[i];
+        }
+
+        gm6020_rx_count++;
+    }
+}
+
 void GM6020_SendCurrent(int16_t iq1,
                         int16_t iq2,
                         int16_t iq3,
