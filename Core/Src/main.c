@@ -33,6 +33,13 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+#define GM6020_FEEDBACK_TIMEOUT_MS          100U
+#define GM6020_DIRECTION_TEST_START_DELAY_MS 3000U
+#define GM6020_DIRECTION_TEST_DRIVE_MS       1000U
+#define GM6020_DIRECTION_TEST_PAUSE_MS       1000U
+#define GM6020_DIRECTION_TEST_CURRENT_RAW    1500
+#define GM6020_DIRECTION_TEST_OUTPUT_LIMIT   1500
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -48,14 +55,28 @@ UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
 
+typedef enum
+{
+  GM6020_TEST_WAITING = 0,
+  GM6020_TEST_POSITIVE,
+  GM6020_TEST_PAUSE,
+  GM6020_TEST_NEGATIVE,
+  GM6020_TEST_COMPLETE,
+  GM6020_TEST_FEEDBACK_FAULT
+} GM6020_DirectionTestState;
+
 /* GM6020 raw feedback values for CubeIDE Live Expressions / Watch. */
 volatile uint8_t gm6020_rx_data[8] = {0};
 volatile uint32_t gm6020_rx_count = 0;
+volatile uint32_t gm6020_last_rx_tick = 0;
 volatile uint32_t fdcan2_last_rx_id = 0;
 volatile uint32_t fdcan2_rx_error_count = 0;
+volatile uint32_t fdcan2_tx_error_count = 0;
 
 static uint32_t vofa_last_tx_tick = 0;
 static char vofa_tx_buffer[64];
+static GM6020_DirectionTestState gm6020_test_state = GM6020_TEST_WAITING;
+static uint32_t gm6020_test_phase_tick = 0;
 
 /* USER CODE END PV */
 
@@ -66,10 +87,11 @@ static void MX_GPIO_Init(void);
 static void MX_FDCAN2_Init(void);
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
-void GM6020_SendCurrent(int16_t iq1,
-                        int16_t iq2,
-                        int16_t iq3,
-                        int16_t iq4);
+HAL_StatusTypeDef GM6020_SendCurrent(int16_t iq1,
+                                    int16_t iq2,
+                                    int16_t iq3,
+                                    int16_t iq4);
+int16_t GM6020_LimitOutput(int32_t output);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -146,52 +168,130 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  GM6020_SendCurrent(3000,0,0,0);
+	  uint8_t feedback[8];
+	  uint32_t feedback_count;
+	  uint32_t feedback_tick;
+	  uint32_t now;
+	  uint8_t feedback_fresh;
+	  int16_t speed_rpm;
+	  int16_t current_raw;
+	  int16_t control_output;
+	  uint32_t i;
+
+	  now = HAL_GetTick();
+
+	  __disable_irq();
+	  for (i = 0; i < 8U; i++)
+	  {
+		  feedback[i] = gm6020_rx_data[i];
+	  }
+	  feedback_count = gm6020_rx_count;
+	  feedback_tick = gm6020_last_rx_tick;
+	  __enable_irq();
+
+	  speed_rpm = (int16_t)(((uint16_t)feedback[2] << 8) | feedback[3]);
+	  current_raw = (int16_t)(((uint16_t)feedback[4] << 8) | feedback[5]);
+	  feedback_fresh = ((feedback_count > 0U) &&
+						 ((now - feedback_tick) <= GM6020_FEEDBACK_TIMEOUT_MS)) ? 1U : 0U;
+	  control_output = 0;
+
+	  switch (gm6020_test_state)
+	  {
+		  case GM6020_TEST_WAITING:
+			  if ((now >= GM6020_DIRECTION_TEST_START_DELAY_MS) &&
+				  (feedback_fresh != 0U))
+			  {
+				  gm6020_test_state = GM6020_TEST_POSITIVE;
+				  gm6020_test_phase_tick = now;
+			  }
+			  break;
+
+		  case GM6020_TEST_POSITIVE:
+			  if (feedback_fresh == 0U)
+			  {
+				  gm6020_test_state = GM6020_TEST_FEEDBACK_FAULT;
+			  }
+			  else if ((now - gm6020_test_phase_tick) >=
+					   GM6020_DIRECTION_TEST_DRIVE_MS)
+			  {
+				  gm6020_test_state = GM6020_TEST_PAUSE;
+				  gm6020_test_phase_tick = now;
+			  }
+			  else
+			  {
+				  control_output = GM6020_DIRECTION_TEST_CURRENT_RAW;
+			  }
+			  break;
+
+		  case GM6020_TEST_PAUSE:
+			  if (feedback_fresh == 0U)
+			  {
+				  gm6020_test_state = GM6020_TEST_FEEDBACK_FAULT;
+			  }
+			  else if ((now - gm6020_test_phase_tick) >=
+					   GM6020_DIRECTION_TEST_PAUSE_MS)
+			  {
+				  gm6020_test_state = GM6020_TEST_NEGATIVE;
+				  gm6020_test_phase_tick = now;
+			  }
+			  break;
+
+		  case GM6020_TEST_NEGATIVE:
+			  if (feedback_fresh == 0U)
+			  {
+				  gm6020_test_state = GM6020_TEST_FEEDBACK_FAULT;
+			  }
+			  else if ((now - gm6020_test_phase_tick) >=
+					   GM6020_DIRECTION_TEST_DRIVE_MS)
+			  {
+				  gm6020_test_state = GM6020_TEST_COMPLETE;
+			  }
+			  else
+			  {
+				  control_output = -GM6020_DIRECTION_TEST_CURRENT_RAW;
+			  }
+			  break;
+
+		  case GM6020_TEST_COMPLETE:
+		  case GM6020_TEST_FEEDBACK_FAULT:
+		  default:
+			  control_output = 0;
+			  break;
+	  }
+
+	  control_output = GM6020_LimitOutput(control_output);
+	  if (GM6020_SendCurrent(control_output, 0, 0, 0) != HAL_OK)
+	  {
+		  control_output = 0;
+
+		  if ((gm6020_test_state != GM6020_TEST_WAITING) &&
+			  (gm6020_test_state != GM6020_TEST_COMPLETE))
+		  {
+			  gm6020_test_state = GM6020_TEST_FEEDBACK_FAULT;
+		  }
+	  }
 
 	  if ((HAL_GetTick() - vofa_last_tx_tick) >= 50U)
 	  {
-		  uint8_t feedback[8];
-		  uint32_t feedback_count;
-		  uint16_t angle_raw;
-		  int16_t speed_rpm;
-		  int16_t current_raw;
-		  uint8_t temperature_c;
 		  int tx_length;
-		  uint32_t i;
 
 		  vofa_last_tx_tick = HAL_GetTick();
 
-		  __disable_irq();
-		  for (i = 0; i < 8U; i++)
+		  tx_length = snprintf(vofa_tx_buffer,
+							 sizeof(vofa_tx_buffer),
+							 "direction:%d,%d,%d,%u\r\n",
+							 (int)control_output,
+							 (int)speed_rpm,
+							 (int)current_raw,
+							 (unsigned int)gm6020_test_state);
+
+		  if ((tx_length > 0) &&
+			  ((size_t)tx_length < sizeof(vofa_tx_buffer)))
 		  {
-			  feedback[i] = gm6020_rx_data[i];
-		  }
-		  feedback_count = gm6020_rx_count;
-		  __enable_irq();
-
-		  if (feedback_count > 0U)
-		  {
-			  angle_raw = ((uint16_t)feedback[0] << 8) | feedback[1];
-			  speed_rpm = (int16_t)(((uint16_t)feedback[2] << 8) | feedback[3]);
-			  current_raw = (int16_t)(((uint16_t)feedback[4] << 8) | feedback[5]);
-			  temperature_c = feedback[6];
-
-			  tx_length = snprintf(vofa_tx_buffer,
-								 sizeof(vofa_tx_buffer),
-								 "gm6020:%u,%d,%d,%u\r\n",
-								 (unsigned int)angle_raw,
-								 (int)speed_rpm,
-								 (int)current_raw,
-								 (unsigned int)temperature_c);
-
-			  if ((tx_length > 0) &&
-				  ((size_t)tx_length < sizeof(vofa_tx_buffer)))
-			  {
-				  (void)HAL_UART_Transmit(&huart1,
-								 (uint8_t *)vofa_tx_buffer,
-								 (uint16_t)tx_length,
-								 100U);
-			  }
+			  (void)HAL_UART_Transmit(&huart1,
+							 (uint8_t *)vofa_tx_buffer,
+							 (uint16_t)tx_length,
+							 20U);
 		  }
 	  }
 
@@ -429,16 +529,32 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
         }
 
         gm6020_rx_count++;
+        gm6020_last_rx_tick = HAL_GetTick();
     }
 }
 
-void GM6020_SendCurrent(int16_t iq1,
-                        int16_t iq2,
-                        int16_t iq3,
-                        int16_t iq4)
+int16_t GM6020_LimitOutput(int32_t output)
+{
+    if (output > GM6020_DIRECTION_TEST_OUTPUT_LIMIT)
+    {
+        output = GM6020_DIRECTION_TEST_OUTPUT_LIMIT;
+    }
+    else if (output < -GM6020_DIRECTION_TEST_OUTPUT_LIMIT)
+    {
+        output = -GM6020_DIRECTION_TEST_OUTPUT_LIMIT;
+    }
+
+    return (int16_t)output;
+}
+
+HAL_StatusTypeDef GM6020_SendCurrent(int16_t iq1,
+                                    int16_t iq2,
+                                    int16_t iq3,
+                                    int16_t iq4)
 {
     FDCAN_TxHeaderTypeDef TxHeader;
     uint8_t TxData[8];
+    HAL_StatusTypeDef status;
 
     TxHeader.Identifier = 0x1FF;
     TxHeader.IdType = FDCAN_STANDARD_ID;
@@ -462,12 +578,15 @@ void GM6020_SendCurrent(int16_t iq1,
     TxData[6] = iq4 >> 8;
     TxData[7] = iq4;
 
-    if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2,
-                                     &TxHeader,
-                                     TxData) != HAL_OK)
+    status = HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2,
+                                          &TxHeader,
+                                          TxData);
+    if (status != HAL_OK)
     {
-        Error_Handler();
+        fdcan2_tx_error_count++;
     }
+
+    return status;
 }
 /* USER CODE END 4 */
 
