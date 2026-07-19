@@ -33,12 +33,13 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-#define GM6020_FEEDBACK_TIMEOUT_MS          100U
-#define GM6020_DIRECTION_TEST_START_DELAY_MS 3000U
-#define GM6020_DIRECTION_TEST_DRIVE_MS       1000U
-#define GM6020_DIRECTION_TEST_PAUSE_MS       1000U
-#define GM6020_DIRECTION_TEST_CURRENT_RAW    1500
-#define GM6020_DIRECTION_TEST_OUTPUT_LIMIT   1500
+#define GM6020_CONTROL_PERIOD_MS          5U
+#define GM6020_FEEDBACK_TIMEOUT_MS        100U
+#define GM6020_SPEED_TEST_START_DELAY_MS  3000U
+#define GM6020_SPEED_TEST_DURATION_MS     5000U
+#define GM6020_SPEED_TARGET_RPM           10
+#define GM6020_SPEED_KP                   100.0f
+#define GM6020_CONTROL_OUTPUT_LIMIT       1500
 
 /* USER CODE END PD */
 
@@ -57,13 +58,12 @@ UART_HandleTypeDef huart1;
 
 typedef enum
 {
-  GM6020_TEST_WAITING = 0,
-  GM6020_TEST_POSITIVE,
-  GM6020_TEST_PAUSE,
-  GM6020_TEST_NEGATIVE,
-  GM6020_TEST_COMPLETE,
-  GM6020_TEST_FEEDBACK_FAULT
-} GM6020_DirectionTestState;
+  GM6020_CONTROL_WAITING = 0,
+  GM6020_CONTROL_RUNNING,
+  GM6020_CONTROL_COMPLETE,
+  GM6020_CONTROL_FEEDBACK_FAULT,
+  GM6020_CONTROL_TX_FAULT
+} GM6020_ControlState;
 
 /* GM6020 raw feedback values for CubeIDE Live Expressions / Watch. */
 volatile uint8_t gm6020_rx_data[8] = {0};
@@ -75,8 +75,13 @@ volatile uint32_t fdcan2_tx_error_count = 0;
 
 static uint32_t vofa_last_tx_tick = 0;
 static char vofa_tx_buffer[64];
-static GM6020_DirectionTestState gm6020_test_state = GM6020_TEST_WAITING;
-static uint32_t gm6020_test_phase_tick = 0;
+static GM6020_ControlState gm6020_control_state = GM6020_CONTROL_WAITING;
+static uint32_t gm6020_last_control_tick = 0;
+static uint32_t gm6020_speed_test_start_tick = 0;
+static int16_t gm6020_speed_target_rpm = 0;
+static int16_t gm6020_speed_feedback_rpm = 0;
+static int16_t gm6020_speed_error_rpm = 0;
+static int16_t gm6020_control_output = 0;
 
 /* USER CODE END PV */
 
@@ -92,6 +97,7 @@ HAL_StatusTypeDef GM6020_SendCurrent(int16_t iq1,
                                     int16_t iq3,
                                     int16_t iq4);
 int16_t GM6020_LimitOutput(int32_t output);
+void GM6020_RunSpeedPControl(uint32_t now);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -162,128 +168,45 @@ int main(void)
       Error_Handler();
   }
 
+  gm6020_last_control_tick = HAL_GetTick();
+  vofa_last_tx_tick = HAL_GetTick();
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  uint8_t feedback[8];
-	  uint32_t feedback_count;
-	  uint32_t feedback_tick;
 	  uint32_t now;
-	  uint8_t feedback_fresh;
-	  int16_t speed_rpm;
-	  int16_t current_raw;
-	  int16_t control_output;
-	  uint32_t i;
 
 	  now = HAL_GetTick();
 
-	  __disable_irq();
-	  for (i = 0; i < 8U; i++)
+	  if ((now - gm6020_last_control_tick) >= GM6020_CONTROL_PERIOD_MS)
 	  {
-		  feedback[i] = gm6020_rx_data[i];
-	  }
-	  feedback_count = gm6020_rx_count;
-	  feedback_tick = gm6020_last_rx_tick;
-	  __enable_irq();
+		  gm6020_last_control_tick += GM6020_CONTROL_PERIOD_MS;
 
-	  speed_rpm = (int16_t)(((uint16_t)feedback[2] << 8) | feedback[3]);
-	  current_raw = (int16_t)(((uint16_t)feedback[4] << 8) | feedback[5]);
-	  feedback_fresh = ((feedback_count > 0U) &&
-						 ((now - feedback_tick) <= GM6020_FEEDBACK_TIMEOUT_MS)) ? 1U : 0U;
-	  control_output = 0;
-
-	  switch (gm6020_test_state)
-	  {
-		  case GM6020_TEST_WAITING:
-			  if ((now >= GM6020_DIRECTION_TEST_START_DELAY_MS) &&
-				  (feedback_fresh != 0U))
-			  {
-				  gm6020_test_state = GM6020_TEST_POSITIVE;
-				  gm6020_test_phase_tick = now;
-			  }
-			  break;
-
-		  case GM6020_TEST_POSITIVE:
-			  if (feedback_fresh == 0U)
-			  {
-				  gm6020_test_state = GM6020_TEST_FEEDBACK_FAULT;
-			  }
-			  else if ((now - gm6020_test_phase_tick) >=
-					   GM6020_DIRECTION_TEST_DRIVE_MS)
-			  {
-				  gm6020_test_state = GM6020_TEST_PAUSE;
-				  gm6020_test_phase_tick = now;
-			  }
-			  else
-			  {
-				  control_output = GM6020_DIRECTION_TEST_CURRENT_RAW;
-			  }
-			  break;
-
-		  case GM6020_TEST_PAUSE:
-			  if (feedback_fresh == 0U)
-			  {
-				  gm6020_test_state = GM6020_TEST_FEEDBACK_FAULT;
-			  }
-			  else if ((now - gm6020_test_phase_tick) >=
-					   GM6020_DIRECTION_TEST_PAUSE_MS)
-			  {
-				  gm6020_test_state = GM6020_TEST_NEGATIVE;
-				  gm6020_test_phase_tick = now;
-			  }
-			  break;
-
-		  case GM6020_TEST_NEGATIVE:
-			  if (feedback_fresh == 0U)
-			  {
-				  gm6020_test_state = GM6020_TEST_FEEDBACK_FAULT;
-			  }
-			  else if ((now - gm6020_test_phase_tick) >=
-					   GM6020_DIRECTION_TEST_DRIVE_MS)
-			  {
-				  gm6020_test_state = GM6020_TEST_COMPLETE;
-			  }
-			  else
-			  {
-				  control_output = -GM6020_DIRECTION_TEST_CURRENT_RAW;
-			  }
-			  break;
-
-		  case GM6020_TEST_COMPLETE:
-		  case GM6020_TEST_FEEDBACK_FAULT:
-		  default:
-			  control_output = 0;
-			  break;
-	  }
-
-	  control_output = GM6020_LimitOutput(control_output);
-	  if (GM6020_SendCurrent(control_output, 0, 0, 0) != HAL_OK)
-	  {
-		  control_output = 0;
-
-		  if ((gm6020_test_state != GM6020_TEST_WAITING) &&
-			  (gm6020_test_state != GM6020_TEST_COMPLETE))
+		  if ((now - gm6020_last_control_tick) >= GM6020_CONTROL_PERIOD_MS)
 		  {
-			  gm6020_test_state = GM6020_TEST_FEEDBACK_FAULT;
+			  gm6020_last_control_tick = now;
 		  }
+
+		  GM6020_RunSpeedPControl(now);
 	  }
 
-	  if ((HAL_GetTick() - vofa_last_tx_tick) >= 50U)
+	  if ((now - vofa_last_tx_tick) >= 50U)
 	  {
 		  int tx_length;
 
-		  vofa_last_tx_tick = HAL_GetTick();
+		  vofa_last_tx_tick = now;
 
 		  tx_length = snprintf(vofa_tx_buffer,
 							 sizeof(vofa_tx_buffer),
-							 "direction:%d,%d,%d,%u\r\n",
-							 (int)control_output,
-							 (int)speed_rpm,
-							 (int)current_raw,
-							 (unsigned int)gm6020_test_state);
+							 "speed_p:%d,%d,%d,%d,%u\r\n",
+							 (int)gm6020_speed_target_rpm,
+							 (int)gm6020_speed_feedback_rpm,
+							 (int)gm6020_speed_error_rpm,
+							 (int)gm6020_control_output,
+							 (unsigned int)gm6020_control_state);
 
 		  if ((tx_length > 0) &&
 			  ((size_t)tx_length < sizeof(vofa_tx_buffer)))
@@ -294,8 +217,6 @@ int main(void)
 							 20U);
 		  }
 	  }
-
-	  HAL_Delay(2);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -533,15 +454,93 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
     }
 }
 
+void GM6020_RunSpeedPControl(uint32_t now)
+{
+    uint8_t feedback[8];
+    uint32_t feedback_count;
+    uint32_t feedback_tick;
+    uint8_t feedback_fresh;
+    int32_t p_output;
+    uint32_t i;
+
+    __disable_irq();
+    for (i = 0; i < 8U; i++)
+    {
+        feedback[i] = gm6020_rx_data[i];
+    }
+    feedback_count = gm6020_rx_count;
+    feedback_tick = gm6020_last_rx_tick;
+    __enable_irq();
+
+    gm6020_speed_feedback_rpm =
+        (int16_t)(((uint16_t)feedback[2] << 8) | feedback[3]);
+    feedback_fresh = ((feedback_count > 0U) &&
+                      ((now - feedback_tick) <= GM6020_FEEDBACK_TIMEOUT_MS)) ? 1U : 0U;
+
+    gm6020_speed_target_rpm = 0;
+    gm6020_speed_error_rpm =
+        gm6020_speed_target_rpm - gm6020_speed_feedback_rpm;
+    gm6020_control_output = 0;
+
+    switch (gm6020_control_state)
+    {
+        case GM6020_CONTROL_WAITING:
+            if ((now >= GM6020_SPEED_TEST_START_DELAY_MS) &&
+                (feedback_fresh != 0U))
+            {
+                gm6020_control_state = GM6020_CONTROL_RUNNING;
+                gm6020_speed_test_start_tick = now;
+            }
+            break;
+
+        case GM6020_CONTROL_RUNNING:
+            if (feedback_fresh == 0U)
+            {
+                gm6020_control_state = GM6020_CONTROL_FEEDBACK_FAULT;
+            }
+            else if ((now - gm6020_speed_test_start_tick) >=
+                     GM6020_SPEED_TEST_DURATION_MS)
+            {
+                gm6020_control_state = GM6020_CONTROL_COMPLETE;
+            }
+            else
+            {
+                gm6020_speed_target_rpm = GM6020_SPEED_TARGET_RPM;
+                gm6020_speed_error_rpm =
+                    gm6020_speed_target_rpm - gm6020_speed_feedback_rpm;
+                p_output = (int32_t)(GM6020_SPEED_KP *
+                                     (float)gm6020_speed_error_rpm);
+                gm6020_control_output = GM6020_LimitOutput(p_output);
+            }
+            break;
+
+        case GM6020_CONTROL_COMPLETE:
+        case GM6020_CONTROL_FEEDBACK_FAULT:
+        case GM6020_CONTROL_TX_FAULT:
+        default:
+            break;
+    }
+
+    if (GM6020_SendCurrent(gm6020_control_output, 0, 0, 0) != HAL_OK)
+    {
+        gm6020_control_output = 0;
+
+        if (gm6020_control_state == GM6020_CONTROL_RUNNING)
+        {
+            gm6020_control_state = GM6020_CONTROL_TX_FAULT;
+        }
+    }
+}
+
 int16_t GM6020_LimitOutput(int32_t output)
 {
-    if (output > GM6020_DIRECTION_TEST_OUTPUT_LIMIT)
+    if (output > GM6020_CONTROL_OUTPUT_LIMIT)
     {
-        output = GM6020_DIRECTION_TEST_OUTPUT_LIMIT;
+        output = GM6020_CONTROL_OUTPUT_LIMIT;
     }
-    else if (output < -GM6020_DIRECTION_TEST_OUTPUT_LIMIT)
+    else if (output < -GM6020_CONTROL_OUTPUT_LIMIT)
     {
-        output = -GM6020_DIRECTION_TEST_OUTPUT_LIMIT;
+        output = -GM6020_CONTROL_OUTPUT_LIMIT;
     }
 
     return (int16_t)output;
