@@ -21,6 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdio.h>
 
 /* USER CODE END Includes */
 
@@ -43,6 +44,8 @@
 
 FDCAN_HandleTypeDef hfdcan2;
 
+UART_HandleTypeDef huart1;
+
 /* USER CODE BEGIN PV */
 
 /* GM6020 raw feedback values for CubeIDE Live Expressions / Watch. */
@@ -51,6 +54,9 @@ volatile uint32_t gm6020_rx_count = 0;
 volatile uint32_t fdcan2_last_rx_id = 0;
 volatile uint32_t fdcan2_rx_error_count = 0;
 
+static uint32_t vofa_last_tx_tick = 0;
+static char vofa_tx_buffer[64];
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -58,6 +64,7 @@ void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_FDCAN2_Init(void);
+static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 void GM6020_SendCurrent(int16_t iq1,
                         int16_t iq2,
@@ -103,6 +110,7 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_FDCAN2_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
 
   FDCAN_FilterTypeDef sFilter;
@@ -139,6 +147,53 @@ int main(void)
   while (1)
   {
 	  GM6020_SendCurrent(3000,0,0,0);
+
+	  if ((HAL_GetTick() - vofa_last_tx_tick) >= 50U)
+	  {
+		  uint8_t feedback[8];
+		  uint32_t feedback_count;
+		  uint16_t angle_raw;
+		  int16_t speed_rpm;
+		  int16_t current_raw;
+		  uint8_t temperature_c;
+		  int tx_length;
+		  uint32_t i;
+
+		  vofa_last_tx_tick = HAL_GetTick();
+
+		  __disable_irq();
+		  for (i = 0; i < 8U; i++)
+		  {
+			  feedback[i] = gm6020_rx_data[i];
+		  }
+		  feedback_count = gm6020_rx_count;
+		  __enable_irq();
+
+		  if (feedback_count > 0U)
+		  {
+			  angle_raw = ((uint16_t)feedback[0] << 8) | feedback[1];
+			  speed_rpm = (int16_t)(((uint16_t)feedback[2] << 8) | feedback[3]);
+			  current_raw = (int16_t)(((uint16_t)feedback[4] << 8) | feedback[5]);
+			  temperature_c = feedback[6];
+
+			  tx_length = snprintf(vofa_tx_buffer,
+								 sizeof(vofa_tx_buffer),
+								 "gm6020:%u,%d,%d,%u\r\n",
+								 (unsigned int)angle_raw,
+								 (int)speed_rpm,
+								 (int)current_raw,
+								 (unsigned int)temperature_c);
+
+			  if ((tx_length > 0) &&
+				  ((size_t)tx_length < sizeof(vofa_tx_buffer)))
+			  {
+				  (void)HAL_UART_Transmit(&huart1,
+								 (uint8_t *)vofa_tx_buffer,
+								 (uint16_t)tx_length,
+								 100U);
+			  }
+		  }
+	  }
 
 	  HAL_Delay(2);
     /* USER CODE END WHILE */
@@ -261,6 +316,54 @@ static void MX_FDCAN2_Init(void)
 }
 
 /**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart1.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart1, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart1, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -274,6 +377,7 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
