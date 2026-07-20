@@ -39,6 +39,8 @@
 #define GM6020_SPEED_TEST_DURATION_MS     5000U
 #define GM6020_SPEED_TARGET_RPM           10
 #define GM6020_SPEED_KP                   100.0f
+#define GM6020_SPEED_KI                   40.0f
+#define GM6020_SPEED_INTEGRAL_LIMIT       1000.0f
 #define GM6020_CONTROL_OUTPUT_LIMIT       1500
 
 /* USER CODE END PD */
@@ -81,6 +83,9 @@ static uint32_t gm6020_speed_test_start_tick = 0;
 static int16_t gm6020_speed_target_rpm = 0;
 static int16_t gm6020_speed_feedback_rpm = 0;
 static int16_t gm6020_speed_error_rpm = 0;
+static int32_t gm6020_speed_p_output = 0;
+static int32_t gm6020_speed_i_output = 0;
+static float gm6020_speed_integral = 0.0f;
 static int16_t gm6020_control_output = 0;
 
 /* USER CODE END PV */
@@ -97,7 +102,8 @@ HAL_StatusTypeDef GM6020_SendCurrent(int16_t iq1,
                                     int16_t iq3,
                                     int16_t iq4);
 int16_t GM6020_LimitOutput(int32_t output);
-void GM6020_RunSpeedPControl(uint32_t now);
+void GM6020_ResetSpeedPI(void);
+void GM6020_RunSpeedPIControl(uint32_t now);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -190,7 +196,7 @@ int main(void)
 			  gm6020_last_control_tick = now;
 		  }
 
-		  GM6020_RunSpeedPControl(now);
+		  GM6020_RunSpeedPIControl(now);
 	  }
 
 	  if ((now - vofa_last_tx_tick) >= 50U)
@@ -201,12 +207,13 @@ int main(void)
 
 		  tx_length = snprintf(vofa_tx_buffer,
 							 sizeof(vofa_tx_buffer),
-							 "speed_p:%d,%d,%d,%d,%u\r\n",
+							 "speed_pi:%d,%d,%d,%ld,%ld,%d\r\n",
 							 (int)gm6020_speed_target_rpm,
 							 (int)gm6020_speed_feedback_rpm,
 							 (int)gm6020_speed_error_rpm,
-							 (int)gm6020_control_output,
-							 (unsigned int)gm6020_control_state);
+							 (long)gm6020_speed_p_output,
+							 (long)gm6020_speed_i_output,
+							 (int)gm6020_control_output);
 
 		  if ((tx_length > 0) &&
 			  ((size_t)tx_length < sizeof(vofa_tx_buffer)))
@@ -454,13 +461,20 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,
     }
 }
 
-void GM6020_RunSpeedPControl(uint32_t now)
+void GM6020_ResetSpeedPI(void)
+{
+    gm6020_speed_integral = 0.0f;
+    gm6020_speed_i_output = 0;
+}
+
+void GM6020_RunSpeedPIControl(uint32_t now)
 {
     uint8_t feedback[8];
     uint32_t feedback_count;
     uint32_t feedback_tick;
     uint8_t feedback_fresh;
-    int32_t p_output;
+    float integral_candidate;
+    float unsaturated_output;
     uint32_t i;
 
     __disable_irq();
@@ -480,11 +494,14 @@ void GM6020_RunSpeedPControl(uint32_t now)
     gm6020_speed_target_rpm = 0;
     gm6020_speed_error_rpm =
         gm6020_speed_target_rpm - gm6020_speed_feedback_rpm;
+    gm6020_speed_p_output = 0;
     gm6020_control_output = 0;
 
     switch (gm6020_control_state)
     {
         case GM6020_CONTROL_WAITING:
+            GM6020_ResetSpeedPI();
+
             if ((now >= GM6020_SPEED_TEST_START_DELAY_MS) &&
                 (feedback_fresh != 0U))
             {
@@ -497,20 +514,57 @@ void GM6020_RunSpeedPControl(uint32_t now)
             if (feedback_fresh == 0U)
             {
                 gm6020_control_state = GM6020_CONTROL_FEEDBACK_FAULT;
+                GM6020_ResetSpeedPI();
             }
             else if ((now - gm6020_speed_test_start_tick) >=
                      GM6020_SPEED_TEST_DURATION_MS)
             {
                 gm6020_control_state = GM6020_CONTROL_COMPLETE;
+                GM6020_ResetSpeedPI();
             }
             else
             {
                 gm6020_speed_target_rpm = GM6020_SPEED_TARGET_RPM;
                 gm6020_speed_error_rpm =
                     gm6020_speed_target_rpm - gm6020_speed_feedback_rpm;
-                p_output = (int32_t)(GM6020_SPEED_KP *
-                                     (float)gm6020_speed_error_rpm);
-                gm6020_control_output = GM6020_LimitOutput(p_output);
+                gm6020_speed_p_output =
+                    (int32_t)(GM6020_SPEED_KP *
+                              (float)gm6020_speed_error_rpm);
+
+                integral_candidate =
+                    gm6020_speed_integral +
+                    (GM6020_SPEED_KI *
+                     (float)gm6020_speed_error_rpm *
+                     ((float)GM6020_CONTROL_PERIOD_MS / 1000.0f));
+
+                if (integral_candidate > GM6020_SPEED_INTEGRAL_LIMIT)
+                {
+                    integral_candidate = GM6020_SPEED_INTEGRAL_LIMIT;
+                }
+                else if (integral_candidate < -GM6020_SPEED_INTEGRAL_LIMIT)
+                {
+                    integral_candidate = -GM6020_SPEED_INTEGRAL_LIMIT;
+                }
+
+                unsaturated_output =
+                    (float)gm6020_speed_p_output + integral_candidate;
+
+                /* Conditional integration: do not integrate farther into
+                   final-output saturation, but allow integration to unwind. */
+                if (!(((unsaturated_output >
+                        (float)GM6020_CONTROL_OUTPUT_LIMIT) &&
+                       (gm6020_speed_error_rpm > 0)) ||
+                      ((unsaturated_output <
+                        -(float)GM6020_CONTROL_OUTPUT_LIMIT) &&
+                       (gm6020_speed_error_rpm < 0))))
+                {
+                    gm6020_speed_integral = integral_candidate;
+                }
+
+                gm6020_speed_i_output =
+                    (int32_t)gm6020_speed_integral;
+                gm6020_control_output = GM6020_LimitOutput(
+                    gm6020_speed_p_output + gm6020_speed_i_output);
             }
             break;
 
@@ -518,12 +572,14 @@ void GM6020_RunSpeedPControl(uint32_t now)
         case GM6020_CONTROL_FEEDBACK_FAULT:
         case GM6020_CONTROL_TX_FAULT:
         default:
+            GM6020_ResetSpeedPI();
             break;
     }
 
     if (GM6020_SendCurrent(gm6020_control_output, 0, 0, 0) != HAL_OK)
     {
         gm6020_control_output = 0;
+        GM6020_ResetSpeedPI();
 
         if (gm6020_control_state == GM6020_CONTROL_RUNNING)
         {
